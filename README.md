@@ -11,6 +11,12 @@ npm run build
 npm test
 ```
 
+Запуск тестів у Docker:
+
+```bash
+docker compose run --rm api npm test
+```
+
 Для автоматичної перекомпіляції під час розробки:
 
 ```bash
