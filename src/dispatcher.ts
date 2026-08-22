@@ -1,5 +1,6 @@
 import "reflect-metadata";
 
+import { randomUUID } from "node:crypto";
 import type {
   IncomingMessage,
   RequestListener,
@@ -7,22 +8,26 @@ import type {
 } from "node:http";
 
 import { Container, type Constructor } from "./container.js";
+import { runWithRequestContext } from "./context/request-context.js";
 import {
   PARAMS_METADATA,
   type ParamInstruction,
 } from "./decorators/params.js";
-import {
-  ValidationPipe,
-  ValidationPipeError,
-} from "./pipes/validation.pipe.js";
+import { InvalidJsonError } from "./errors/invalid-json.error.js";
+import { NotFoundError } from "./errors/not-found.error.js";
+import { ExceptionFilter } from "./filters/exception.filter.js";
+import { ZodValidationPipe } from "./pipes/zod-validation.pipe.js";
+import type {
+  ErrorFilter,
+  ExecutionContext,
+  Guard,
+  Interceptor,
+  Middleware,
+  Next,
+  Pipe,
+} from "./lifecycle.js";
 import { findRoute, type Route } from "./router.js";
 import { PARAM_TYPES_METADATA } from "./tokens.js";
-
-class InvalidJsonError extends Error {
-  constructor() {
-    super("Invalid JSON body");
-  }
-}
 
 function sendJson(
   response: ServerResponse,
@@ -97,7 +102,7 @@ function buildArguments(
   params: Record<string, string>,
   searchParams: URLSearchParams,
   body: unknown,
-  validationPipe: ValidationPipe,
+  validationPipe: Pipe,
 ): unknown[] {
   const args: unknown[] = [];
 
@@ -132,62 +137,131 @@ function buildArguments(
   return args;
 }
 
+export type DispatcherOptions = {
+  middleware?: Middleware[];
+  guards?: Guard[];
+  interceptors?: Interceptor[];
+  pipe?: Pipe;
+  exceptionFilter?: ErrorFilter;
+};
+
+function wrapWithInterceptors(
+  context: ExecutionContext,
+  interceptors: Interceptor[],
+  handler: Next,
+): Next {
+  return interceptors.reduceRight<Next>(
+    (next, interceptor) => () => interceptor.intercept(context, next),
+    handler,
+  );
+}
+
+function wrapWithMiddleware(
+  context: ExecutionContext,
+  middleware: Middleware[],
+  lifecycle: Next,
+): Next {
+  return middleware.reduceRight<Next>(
+    (next, currentMiddleware) => () =>
+      currentMiddleware.use(context, next),
+    lifecycle,
+  );
+}
+
 export function createDispatcher(
   container: Container,
   routes: Route[],
-  validationPipe = new ValidationPipe(),
+  options: DispatcherOptions = {},
 ): RequestListener {
+  const middleware = options.middleware ?? [];
+  const guards = options.guards ?? [];
+  const interceptors = options.interceptors ?? [];
+  const validationPipe = options.pipe ?? new ZodValidationPipe();
+  const exceptionFilter = options.exceptionFilter ?? new ExceptionFilter();
+
   return async (request, response) => {
-    try {
-      const url = new URL(request.url ?? "/", "http://localhost");
-      const match = findRoute(routes, request.method, url.pathname);
+    const requestIdHeader = request.headers["x-request-id"];
+    const requestId =
+      typeof requestIdHeader === "string" && requestIdHeader.trim().length > 0
+        ? requestIdHeader
+        : randomUUID();
 
-      if (match === undefined) {
-        sendJson(response, 404, { error: "Route not found" });
-        return;
+    response.setHeader("x-request-id", requestId);
+
+    await runWithRequestContext(requestId, async () => {
+      try {
+        const url = new URL(request.url ?? "/", "http://localhost");
+        const match = findRoute(routes, request.method, url.pathname);
+
+        if (match === undefined) {
+          throw new NotFoundError(
+            `Route ${request.method ?? "UNKNOWN"} ${url.pathname} not found`,
+          );
+        }
+
+        const context: ExecutionContext = {
+          request,
+          response,
+          routeMatch: match,
+        };
+
+        const executeRoute = async (): Promise<unknown> => {
+          for (const guard of guards) {
+            if (!(await guard.canActivate(context))) {
+              sendJson(response, 403, { error: "Forbidden" });
+              return undefined;
+            }
+          }
+
+          const invokeHandler = async (): Promise<unknown> => {
+            const instructions = getParameterInstructions(match.route);
+            const parameterTypes = getParameterTypes(match.route);
+            const needsBody = instructions.some(
+              (instruction) => instruction?.source === "body",
+            );
+            const body = needsBody ? await readJsonBody(request) : undefined;
+            const args = buildArguments(
+              instructions,
+              parameterTypes,
+              match.params,
+              url.searchParams,
+              body,
+              validationPipe,
+            );
+
+            const controller = container.resolve(match.route.controller);
+            const handler = Reflect.get(
+              controller as object,
+              match.route.controllerHandlerName,
+            ) as unknown;
+
+            if (typeof handler !== "function") {
+              throw new Error(
+                `Handler ${match.route.controllerHandlerName} is not a function`,
+              );
+            }
+
+            return handler.apply(controller, args);
+          };
+
+          return wrapWithInterceptors(
+            context,
+            interceptors,
+            invokeHandler,
+          )();
+        };
+
+        const result = await wrapWithMiddleware(
+          context,
+          middleware,
+          executeRoute,
+        )();
+        if (!response.writableEnded) {
+          sendJson(response, 200, result ?? null);
+        }
+      } catch (error) {
+        exceptionFilter.catch(error, response);
       }
-
-      const instructions = getParameterInstructions(match.route);
-      const parameterTypes = getParameterTypes(match.route);
-      const needsBody = instructions.some(
-        (instruction) => instruction?.source === "body",
-      );
-      const body = needsBody ? await readJsonBody(request) : undefined;
-      const args = buildArguments(
-        instructions,
-        parameterTypes,
-        match.params,
-        url.searchParams,
-        body,
-        validationPipe,
-      );
-
-      const controller = container.resolve(match.route.controller);
-      const handler = Reflect.get(
-        controller as object,
-        match.route.controllerHandlerName,
-      ) as unknown;
-
-      if (typeof handler !== "function") {
-        throw new Error(
-          `Handler ${match.route.controllerHandlerName} is not a function`,
-        );
-      }
-
-      const result = await handler.apply(controller, args);
-      sendJson(response, 200, result ?? null);
-    } catch (error) {
-      if (error instanceof ValidationPipeError) {
-        sendJson(response, 400, error.errors);
-        return;
-      }
-
-      if (error instanceof InvalidJsonError) {
-        sendJson(response, 400, { error: error.message });
-        return;
-      }
-
-      sendJson(response, 500, { error: "Internal server error" });
-    }
+    });
   };
 }
