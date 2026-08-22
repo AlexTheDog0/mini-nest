@@ -1,6 +1,12 @@
-import { IsEmail } from "../pipes/validation.pipe.js";
+import { z } from 'zod';
 
+import { UseZodSchema } from "../pipes/zod-validation.pipe.js";
+
+const createUserSchema = z.object({
+  email: z.email({ error: "must be a valid email address" }),
+});
+
+@UseZodSchema(createUserSchema)
 export class CreateUserDto {
-  @IsEmail()
   email!: string;
 }
